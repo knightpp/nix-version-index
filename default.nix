@@ -22,7 +22,7 @@ let
       else if lib.isDerivation value
       then mapPackage value
       else if value.recurseForDerivations or false
-      then map value
+      then pkgs.recurseIntoAttrs (map value)
       else null
   );
 
