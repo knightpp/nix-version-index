@@ -8,17 +8,20 @@ import (
 
 type Set map[string]PackageOrSet
 
+type Package struct {
+	PName   string `json:"pname,omitempty"`
+	Version string `json:"version,omitempty"`
+}
+
 type PackageOrSet struct {
 	Package *Package `json:"package,omitempty"`
 	Set     Set      `json:"set,omitempty"`
 }
 
-type recurseForDerivations struct {
-	Recurse bool `json:"recurseForDerivations"`
-}
-
 func (ps *PackageOrSet) UnmarshalJSON(data []byte) error {
-	var shouldRecurse recurseForDerivations
+	var shouldRecurse struct {
+		Recurse bool `json:"recurseForDerivations"`
+	}
 
 	if bytes.Equal(data, []byte("true")) {
 		return nil
@@ -44,9 +47,4 @@ func (ps *PackageOrSet) UnmarshalJSON(data []byte) error {
 	}
 
 	return nil
-}
-
-type Package struct {
-	PName   string `json:"pname,omitempty"`
-	Version string `json:"version,omitempty"`
 }
