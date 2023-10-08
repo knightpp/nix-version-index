@@ -1,0 +1,25 @@
+type Commit {
+  rev
+  date
+  changes
+}
+
+type Change {
+  attr_path
+  version
+}
+
+rev: string @index(hash) @id .
+date: DateTime @index .
+changes: []
+
+# type Commit {
+#   rev: String! @search(by: [hash]) @id
+#   date: DateTime! @search
+#   changes: [Change!]
+# }
+
+# type Change {
+#   attr_path: String! @search(by: [exact])
+#   version: String! @search(by: [exact])
+# }

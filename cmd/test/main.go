@@ -2,27 +2,27 @@ package main
 
 import (
 	"bytes"
-	"encoding/json"
+	"context"
+	_ "embed"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
 
-	"github.com/gocql/gocql"
-	"github.com/knightpp/nix-version-index/internal/attrset"
+	"github.com/go-git/go-billy/v5"
+	"github.com/go-git/go-billy/v5/osfs"
+	"github.com/go-git/go-git/v5"
+	"github.com/go-git/go-git/v5/plumbing/cache"
+	"github.com/go-git/go-git/v5/storage"
+	"github.com/go-git/go-git/v5/storage/filesystem"
+	"github.com/knightpp/nix-version-index/internal/store"
 )
 
-type Commit struct {
-	Rev  string
-	Hash string
-}
-
-func (c Commit) String() string {
-	return fmt.Sprintf("%s-%s", c.Rev, c.Hash)
-}
+//go:embed schema.graphql
+var gqlSchema string
 
 var (
 	rev     string
@@ -44,176 +44,161 @@ func main() {
 	var err error
 	switch {
 	case rev != "" || hash != "":
-		err = evaluate(Commit{Rev: rev, Hash: hash})
-	case query != "":
-		err = executeQuery(query)
-	case writeDb:
-		err = writeToDb()
+		err = evaluate(rev, hash)
+	// case writeDb:
+	// 	err = dgraphRun()
+	// default:
+	// 	log.Print("no command specified")
 	default:
-		log.Print("no command specified")
+		// err = runDgraph(context.Background())
+		err = func() error {
+			ctx := context.Background()
+
+			client, err := store.ConnectDgraph(ctx, "localhost:9080")
+			if err != nil {
+				return fmt.Errorf("connect dgraph: %w", err)
+			}
+
+			defer client.Close()
+
+			err = client.CreateSchema(ctx, gqlSchema)
+			if err != nil {
+				return fmt.Errorf("create schema: %w", err)
+			}
+			return nil
+		}()
 	}
 	if err != nil {
 		log.Fatal(err)
 	}
 }
 
-func createKeyspaceAndTable() error {
-	cluster := gocql.NewCluster("127.0.0.1")
-	cluster.Keyspace = "system"
+func openOrCloneRepo(workTreePath string) (*git.Repository, error) {
+	gitPath := filepath.Join(workTreePath, ".git")
+	gitStorage := filesystem.NewStorage(osfs.New(gitPath), cache.NewObjectLRUDefault())
+	workTree := osfs.New(workTreePath)
 
-	session, err := cluster.CreateSession()
+	repo, err := git.Open(gitStorage, workTree)
 	if err != nil {
-		return fmt.Errorf("create session: %w", err)
+		switch {
+		case errors.Is(err, git.ErrRepositoryNotExists):
+			return cloneRepo(gitStorage, workTree)
+		default:
+			return nil, fmt.Errorf("open git: %w", err)
+		}
 	}
 
-	defer session.Close()
+	return repo, nil
+}
 
-	err = session.Query("CREATE KEYSPACE IF NOT EXISTS versions WITH REPLICATION = {'class':'SimpleStrategy','replication_factor':1}").Exec()
+func cloneRepo(s storage.Storer, workTree billy.Filesystem) (*git.Repository, error) {
+	repo, err := git.Clone(s, workTree, &git.CloneOptions{
+		URL:           "https://github.com/NixOS/nixpkgs.git",
+		ReferenceName: "master",
+		SingleBranch:  true,
+		NoCheckout:    true,
+		Progress:      os.Stdout,
+		Tags:          git.NoTags,
+	})
 	if err != nil {
-		return fmt.Errorf("create keyspace: %w", err)
+		return nil, fmt.Errorf("clone nixpkgs: %w", err)
 	}
 
-	err = session.Query(`
-		CREATE TABLE IF NOT EXISTS versions.db (
-			rev text,
-			attr text,
-			version text,
-			PRIMARY KEY ((attr,rev),version)
-		) 
-	`).Exec()
+	return repo, nil
+}
+
+func runDgraph(ctx context.Context) error {
+	const (
+		nixpkgsPath = "/tmp/nixpkgs"
+		commitV014  = "6ed8a76ac64c88df0df3f01b536498983ad5ad23"
+	)
+
+	repo, err := openOrCloneRepo(nixpkgsPath)
 	if err != nil {
-		return fmt.Errorf("create table: %w", err)
+		return fmt.Errorf("open or clone repo: %w", err)
 	}
 
-	err = session.Query(`CREATE INDEX IF NOT EXISTS rev_index ON versions.db (rev)`).Exec()
+	wt, err := repo.Worktree()
 	if err != nil {
-		return fmt.Errorf("create rev index: %w", err)
+		return fmt.Errorf("worktree: %w", err)
 	}
 
-	err = session.Query(`CREATE INDEX IF NOT EXISTS attr_index ON versions.db (attr)`).Exec()
+	err = wt.Checkout(&git.CheckoutOptions{
+		Branch: "refs/heads/master",
+		Force:  true,
+	})
 	if err != nil {
-		return fmt.Errorf("create attr index: %w", err)
+		return fmt.Errorf("checkout: %w", err)
 	}
+
+	head, err := repo.Head()
+	if err != nil {
+		return fmt.Errorf("head: %w", err)
+	}
+
+	commit, err := repo.CommitObject(head.Hash())
+	if err != nil {
+		return fmt.Errorf("commit object: %w", err)
+	}
+
+	client, err := store.ConnectDgraph(ctx, "127.0.0.1:9080")
+	if err != nil {
+		return fmt.Errorf("connect dgraph: %w", err)
+	}
+
+	err = client.CreateSchema(ctx, gqlSchema)
+	if err != nil {
+		return fmt.Errorf("create schema: %w", err)
+	}
+
+	for commit.Hash.String() != commitV014 {
+		if commit.NumParents() != 1 {
+			return fmt.Errorf("num parents != 1 in %s", commit)
+		}
+
+		commit, err = commit.Parent(0)
+		if err != nil {
+			return fmt.Errorf("parent: %w", err)
+		}
+
+	}
+
+	// err = wt.PullContext(ctx, &git.PullOptions{
+	// 	RemoteName:    "upstream",
+	// 	ReferenceName: "refs/heads/master",
+	// 	SingleBranch:  true,
+	// 	Progress:      os.Stdout,
+	// })
+	// if err != nil {
+	// 	return fmt.Errorf("pull: %w", err)
+	// }
+
+	// cIter, err := repo.CommitObjects()
+	// if err != nil {
+	// 	return fmt.Errorf("iterate commits: %w", err)
+	// }
+
+	// defer cIter.Close()
+
+	// for i := 0; i < 10; i++ {
+	// 	commit, err := cIter.Next()
+	// 	if err != nil {
+	// 		return fmt.Errorf("next: %w", err)
+	// 	}
+
+	// 	fmt.Println(commit.String())
+	// }
 
 	return nil
 }
 
-func writeToDb() error {
-	err := createKeyspaceAndTable()
-	if err != nil {
-		return fmt.Errorf("create keyspace and table: %w", err)
-	}
-
-	cluster := gocql.NewCluster("127.0.0.1")
-	cluster.Keyspace = "versions"
-
-	session, err := cluster.CreateSession()
-	if err != nil {
-		return fmt.Errorf("create session: %w", err)
-	}
-
-	defer session.Close()
-
-	dirEntries, err := os.ReadDir("packages")
-	if err != nil {
-		return fmt.Errorf("read dir: %w", err)
-	}
-
-	for _, entry := range dirEntries {
-		if entry.IsDir() {
-			continue
-		}
-
-		rev, _, _ := strings.Cut(entry.Name(), "-")
-		var count int
-
-		err = session.Query("SELECT COUNT(*) FROM db WHERE rev = ?", rev).Scan(&count)
-		if err != nil {
-			return fmt.Errorf("query count: %w", err)
-		}
-
-		if count != 0 {
-			continue
-		}
-
-		data, err := os.ReadFile(filepath.Join("packages", entry.Name()))
-		if err != nil {
-			return err
-		}
-
-		var set attrset.Set
-		err = json.Unmarshal(data, &set)
-		if err != nil {
-			return err
-		}
-
-		batch := session.NewBatch(gocql.UnloggedBatch)
-
-		var i int
-		attrToVersion := attrset.Flatten(set)
-		for attr, version := range attrToVersion {
-			i++
-			if i%1000 == 0 {
-				fmt.Printf("processing %d/%d\n", i, len(attrToVersion))
-			}
-
-			if batch.Size() >= 500 {
-				err = session.ExecuteBatch(batch)
-				if err != nil {
-					return fmt.Errorf("execute batch: %w", err)
-				}
-
-				batch = session.NewBatch(gocql.UnloggedBatch)
-			}
-
-			batch.Query("INSERT into db (rev,attr,version) VALUES (?, ?, ?)", rev, attr, version)
-		}
-
-		err = session.ExecuteBatch(batch)
-		if err != nil {
-			return fmt.Errorf("execute batch: %w", err)
-		}
-	}
-
-	return nil
-}
-
-func executeQuery(query string) error {
-	dirEntries, err := os.ReadDir("packages")
-	if err != nil {
-		return fmt.Errorf("read dir: %w", err)
-	}
-
-	for _, entry := range dirEntries {
-		if entry.IsDir() {
-			continue
-		}
-
-		data, err := os.ReadFile(filepath.Join("packages", entry.Name()))
-		if err != nil {
-			log.Fatal(err)
-		}
-
-		var set attrset.Set
-		err = json.Unmarshal(data, &set)
-		if err != nil {
-			log.Fatal(err)
-		}
-
-		jsonBytes, _ := json.MarshalIndent(set[query], "", "  ")
-		fmt.Printf(">>> %s <<<\n%s\n", entry.Name(), jsonBytes)
-		continue
-	}
-	return nil
-}
-
-func evaluate(commit Commit) error {
-	path := "packages/" + commit.String() + ".json"
+func evaluate(rev, hash string) error {
+	path := fmt.Sprintf("packages/%s-%s.json", rev, hash)
 	_, err := os.Stat(path)
 	if err == nil {
 		return nil
 	} else {
-		log.Printf("no cache for %s", commit)
+		log.Printf("no cache for %q", path)
 	}
 
 	var (
@@ -223,7 +208,7 @@ func evaluate(commit Commit) error {
 	cmd := exec.Command("nix", "eval", "--file", "./default.nix", "--raw", "--show-trace")
 	cmd.Stderr = &stderr
 	cmd.Stdout = &stdout
-	cmd.Env = append(cmd.Env, "COMMIT="+commit.Rev, "SHA="+commit.Hash)
+	cmd.Env = append(cmd.Env, "COMMIT="+rev, "SHA="+hash)
 
 	err = cmd.Run()
 	if err != nil {

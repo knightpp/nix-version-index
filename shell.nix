@@ -10,5 +10,6 @@ in
       go-tools
       gopls
       delve
+      gomodifytags
     ];
   }

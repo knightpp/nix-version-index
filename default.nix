@@ -12,8 +12,8 @@ let
     };
 
   lib = pkgs.lib;
-  filter =
-    lib.attrsets.filterAttrsRecursive (name: value: name != null && value != null && value != {});
+  # filter =
+  #   lib.attrsets.filterAttrsRecursive (name: value: name != null && value != null && value != {});
 
   map = pkgs.lib.attrsets.mapAttrs (
     name: value:
@@ -43,4 +43,4 @@ let
     }
     else null;
 in
-  builtins.toJSON (filter (map pkgs))
+  builtins.toJSON (map pkgs)
