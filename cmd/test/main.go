@@ -7,7 +7,6 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -19,9 +18,11 @@ import (
 	"github.com/go-git/go-git/v5/storage"
 	"github.com/go-git/go-git/v5/storage/filesystem"
 	"github.com/knightpp/nix-version-index/internal/store"
+	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/log"
 )
 
-//go:embed schema.graphql
+//go:embed schema.dql
 var gqlSchema string
 
 var (
@@ -29,6 +30,7 @@ var (
 	hash    string
 	query   string
 	writeDb bool
+	dropDb  bool
 )
 
 func init() {
@@ -36,10 +38,14 @@ func init() {
 	flag.StringVar(&hash, "hash", "", "unpacked tarball hash")
 	flag.StringVar(&query, "query", "", "nix attrset path")
 	flag.BoolVar(&writeDb, "write", false, "write to db")
+	flag.BoolVar(&dropDb, "drop", false, "drop db")
 }
 
 func main() {
 	flag.Parse()
+
+	logger := zerolog.New(zerolog.NewConsoleWriter()).With().Timestamp().Logger()
+	log.Logger = logger
 
 	var err error
 	switch {
@@ -50,26 +56,10 @@ func main() {
 	// default:
 	// 	log.Print("no command specified")
 	default:
-		// err = runDgraph(context.Background())
-		err = func() error {
-			ctx := context.Background()
-
-			client, err := store.ConnectDgraph(ctx, "localhost:9080")
-			if err != nil {
-				return fmt.Errorf("connect dgraph: %w", err)
-			}
-
-			defer client.Close()
-
-			err = client.CreateSchema(ctx, gqlSchema)
-			if err != nil {
-				return fmt.Errorf("create schema: %w", err)
-			}
-			return nil
-		}()
+		err = runDgraph(context.Background())
 	}
 	if err != nil {
-		log.Fatal(err)
+		log.Fatal().Err(err).Send()
 	}
 }
 
@@ -113,56 +103,28 @@ func runDgraph(ctx context.Context) error {
 		commitV014  = "6ed8a76ac64c88df0df3f01b536498983ad5ad23"
 	)
 
-	repo, err := openOrCloneRepo(nixpkgsPath)
-	if err != nil {
-		return fmt.Errorf("open or clone repo: %w", err)
-	}
-
-	wt, err := repo.Worktree()
-	if err != nil {
-		return fmt.Errorf("worktree: %w", err)
-	}
-
-	err = wt.Checkout(&git.CheckoutOptions{
-		Branch: "refs/heads/master",
-		Force:  true,
-	})
-	if err != nil {
-		return fmt.Errorf("checkout: %w", err)
-	}
-
-	head, err := repo.Head()
-	if err != nil {
-		return fmt.Errorf("head: %w", err)
-	}
-
-	commit, err := repo.CommitObject(head.Hash())
-	if err != nil {
-		return fmt.Errorf("commit object: %w", err)
-	}
-
 	client, err := store.ConnectDgraph(ctx, "127.0.0.1:9080")
 	if err != nil {
 		return fmt.Errorf("connect dgraph: %w", err)
 	}
 
-	err = client.CreateSchema(ctx, gqlSchema)
+	defer client.Close()
+
+	if dropDb {
+		return client.DropDatabase(ctx)
+	}
+
+	repo, err := openOrCloneRepo(nixpkgsPath)
 	if err != nil {
-		return fmt.Errorf("create schema: %w", err)
+		return fmt.Errorf("open or clone repo: %w", err)
 	}
 
-	for commit.Hash.String() != commitV014 {
-		if commit.NumParents() != 1 {
-			return fmt.Errorf("num parents != 1 in %s", commit)
-		}
+	// wt, err := repo.Worktree()
+	// if err != nil {
+	// 	return fmt.Errorf("worktree: %w", err)
+	// }
 
-		commit, err = commit.Parent(0)
-		if err != nil {
-			return fmt.Errorf("parent: %w", err)
-		}
-
-	}
-
+	// log.Info().Msg("git pull")
 	// err = wt.PullContext(ctx, &git.PullOptions{
 	// 	RemoteName:    "upstream",
 	// 	ReferenceName: "refs/heads/master",
@@ -170,24 +132,78 @@ func runDgraph(ctx context.Context) error {
 	// 	Progress:      os.Stdout,
 	// })
 	// if err != nil {
-	// 	return fmt.Errorf("pull: %w", err)
-	// }
-
-	// cIter, err := repo.CommitObjects()
-	// if err != nil {
-	// 	return fmt.Errorf("iterate commits: %w", err)
-	// }
-
-	// defer cIter.Close()
-
-	// for i := 0; i < 10; i++ {
-	// 	commit, err := cIter.Next()
-	// 	if err != nil {
-	// 		return fmt.Errorf("next: %w", err)
+	// 	switch {
+	// 	case errors.Is(err, git.NoErrAlreadyUpToDate):
+	// 		log.Info().Msg("up to date!")
+	// 	default:
+	// 		return fmt.Errorf("pull: %w", err)
 	// 	}
-
-	// 	fmt.Println(commit.String())
 	// }
+
+	// log.Info().Msg("git checkout")
+	// err = wt.Checkout(&git.CheckoutOptions{
+	// 	Branch: "refs/heads/master",
+	// 	Force:  true,
+	// })
+	// if err != nil {
+	// 	return fmt.Errorf("checkout: %w", err)
+	// }
+
+	head, err := repo.Head()
+	if err != nil {
+		return fmt.Errorf("head: %w", err)
+	}
+
+	err = client.CreateSchema(ctx, gqlSchema)
+	if err != nil {
+		return fmt.Errorf("create schema: %w", err)
+	}
+
+	iter, err := repo.Log(&git.LogOptions{
+		From:  head.Hash(),
+		Order: git.LogOrderCommitterTime,
+	})
+	if err != nil {
+		return fmt.Errorf("git log: %w", err)
+	}
+
+	defer iter.Close()
+
+	// for commit.Hash.String() != commitV014 {
+	for i := 0; i < 10; i++ {
+		commit, err := iter.Next()
+		if err != nil {
+			return fmt.Errorf("next commit: %w", err)
+		}
+
+		log.Info().Time("when", commit.Author.When).Str("hash", commit.Hash.String()).Msg("got commit")
+
+		ok, err := client.CommitExists(ctx, commit.Hash.String())
+		if err != nil {
+			return fmt.Errorf("commit exists: %w", err)
+		}
+
+		if ok {
+			log.Info().Stringer("hash", commit.Hash).Msg("already exists")
+			continue
+		}
+
+		err = client.Write(ctx, store.Commit{
+			Rev:   rev,
+			Date:  commit.Author.When,
+			DType: []string{"Commit"},
+			Changes: []store.Change{
+				{
+					AttrPath: "python3",
+					Version:  "3.0.1",
+					DType:    []string{"Change"},
+				},
+			},
+		})
+		if err != nil {
+			return fmt.Errorf("write: %w", err)
+		}
+	}
 
 	return nil
 }

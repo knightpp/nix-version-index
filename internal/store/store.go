@@ -1,10 +1,10 @@
 package store
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/dgraph-io/dgo/v230"
@@ -13,14 +13,18 @@ import (
 )
 
 type Commit struct {
-	Rev     string     `json:"rev,omitempty"`
-	Date    *time.Time `json:"date,omitempty"`
-	Changes []Change   `json:"changes,omitempty"`
+	Uid     string    `json:"uid,omitempty"`
+	Rev     string    `json:"rev,omitempty"`
+	Date    time.Time `json:"date,omitempty"`
+	Changes []Change  `json:"changes,omitempty"`
+	DType   []string  `json:"dgraph.type,omitempty"`
 }
 
 type Change struct {
-	AttrPath string `json:"attr_path,omitempty"`
-	Version  string `json:"version,omitempty"`
+	Uid      string   `json:"uid,omitempty"`
+	AttrPath string   `json:"attr_path,omitempty"`
+	Version  string   `json:"version,omitempty"`
+	DType    []string `json:"dgraph.type,omitempty"`
 }
 
 type Dgraph struct {
@@ -28,7 +32,6 @@ type Dgraph struct {
 	client *dgo.Dgraph
 }
 
-// "127.0.0.1:9080"
 func ConnectDgraph(ctx context.Context, target string) (*Dgraph, error) {
 	conn, err := grpc.DialContext(ctx, target, grpc.WithInsecure())
 	if err != nil {
@@ -63,24 +66,33 @@ func (d *Dgraph) Write(ctx context.Context, commits ...Commit) error {
 	txn := d.client.NewTxn()
 	defer txn.Discard(ctx)
 
-	var buf bytes.Buffer
-	for _, commit := range commits {
-		buf.Reset()
-		err := json.NewEncoder(&buf).Encode(commit)
-		if err != nil {
-			return fmt.Errorf("encode json: %w", err)
-		}
-
-		_, err = txn.Mutate(ctx, &api.Mutation{
-			SetJson:   buf.Bytes(),
-			CommitNow: false,
-		})
-		if err != nil {
-			return fmt.Errorf("mutate: %w", err)
+	commitType := []string{"Commit"}
+	changeType := []string{"Change"}
+	for i := range commits {
+		commits[i].DType = commitType
+		commits[i].Uid = "_:commit" + strconv.Itoa(i)
+		for j := range commits[i].Changes {
+			commits[j].Changes[j].DType = changeType
+			commits[j].Changes[j].Uid = fmt.Sprintf("_:commit%d-%d", i, j)
 		}
 	}
 
-	err := txn.Commit(ctx)
+	buf, err := json.Marshal(map[string]any{
+		"set": commits,
+	})
+	if err != nil {
+		return fmt.Errorf("encode json: %w", err)
+	}
+
+	_, err = txn.Mutate(ctx, &api.Mutation{
+		SetJson:   buf,
+		CommitNow: false,
+	})
+	if err != nil {
+		return fmt.Errorf("mutate: %w", err)
+	}
+
+	err = txn.Commit(ctx)
 	if err != nil {
 		return fmt.Errorf("commit: %w", err)
 	}
@@ -88,20 +100,37 @@ func (d *Dgraph) Write(ctx context.Context, commits ...Commit) error {
 	return nil
 }
 
-func (d *Dgraph) CommitExists(ctx context.Context) (bool, error) {
+func (d *Dgraph) CommitExists(ctx context.Context, rev string) (bool, error) {
 	txn := d.client.NewReadOnlyTxn()
 	defer txn.Discard(ctx)
 
 	resp, err := txn.QueryWithVars(ctx, `
-		queryCommit(filter: {rev: {eq: "dwa"}}) {
-    		rev
-  		}
-	`, map[string]string{})
+		query commitExists($targetRev: string){
+			findCommit(func: eq(rev, $targetRev)) {
+				count(uid)
+			}
+		}
+	`, map[string]string{"$targetRev": rev})
 	if err != nil {
 		return false, fmt.Errorf("query: %w", err)
 	}
 
-	_ = resp
+	var body struct {
+		FindCommit []struct {
+			Count int `json:"count"`
+		} `json:"findCommit"`
+	}
 
-	return false, nil
+	err = json.Unmarshal(resp.Json, &body)
+	if err != nil {
+		return false, fmt.Errorf("json umarshal: %w", err)
+	}
+
+	return body.FindCommit[0].Count > 0, nil
+}
+
+func (d *Dgraph) DropDatabase(ctx context.Context) error {
+	return d.client.Alter(ctx, &api.Operation{
+		DropAll: true,
+	})
 }
